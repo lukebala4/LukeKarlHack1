@@ -1,0 +1,8 @@
+node_modules/
+.next/
+output/
+.playwright-cli/
+.env
+.env.local
+.env*.local
+*.tsbuildinfo
