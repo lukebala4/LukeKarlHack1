@@ -14,9 +14,12 @@ export const env = {
   zeroWorkspaceId: read("ZERO_WORKSPACE_ID"),
   scaileApiKey: read("SCAILE_API_KEY"),
   scaileApiBase: read("SCAILE_API_BASE"),
+  unifyAppToken: read("UNIFY_APP_TOKEN"),
+  unifyAppApiBase: read("UNIFY_APP_API_BASE") || "https://app-api.unifygtm.com",
   anthropicApiKey: read("ANTHROPIC_API_KEY"),
   championMinScore: Number(read("CHAMPION_MIN_SCORE") || 70),
   enrichMinScore: Number(read("ENRICH_MIN_SCORE") || 50),
+  outputDir: read("OUTPUT_DIR") || "./output",
 } as const;
 
 /** True if a provider has the minimum config it needs to make a request. */

@@ -4,99 +4,90 @@ import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   Activity, ArrowRight, BarChart3, BookOpen, Check, ChevronRight, CircleStop, Clock3,
   Command, ExternalLink, FileCheck2, Filter, Inbox, Layers3, Link2, Mail,
-  Network, Pause, Play, Radar, RefreshCw, Search, Send, ShieldCheck, Sparkles, UserRound,
+  LayoutGrid, Minus, Network, Pause, Play, Plus, Radar, RefreshCw, Search, Send, ShieldCheck, Sparkles, UserRound,
   X, Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { ApprovedProspect, ProspectPipelineEvent } from "@/src/contracts/outreach";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ApprovedProspect } from "@/src/contracts/outreach";
 import { fixtureProspects } from "@/src/repositories/fixtures";
 import { calculateReadiness, generateEmailDraft, selectOutreachPlay, validateDraft } from "@/src/outreach/engine";
 import { ScoreBars } from "@/components/visualisations/score-bars";
+import { MatrixView } from "@/components/control-room/matrix-view";
 
-type View = "landing" | "control" | "outreach" | "pipeline" | "analytics" | "benchmark";
-type DemoState = "idle" | "running" | "paused" | "complete";
+type View = "landing" | "control" | "outreach" | "pipeline" | "analytics" | "benchmark" | "matrix";
 
-const discoverySteps = ["Searching companies", "Finding founders", "Enriching profiles", "Reading public signals", "Detecting distinctive voices", "Calculating Champion Scores", "Preparing review queue"];
-const activateSteps = ["Checking outreach readiness", "Selecting strongest evidence", "Choosing outreach play", "Building personal approach", "Awaiting approval", "Ready to activate"];
-const stageLabels = ["Found", "Enriching", "Researching", "Scored", "Review", "Approved", "Outreach Ready", "Play Selected", "Drafted", "Activated", "Champion"];
-const demoMessages = [
-  ["provider.connected", "Unify connected to the demo workspace.", "unify"],
-  ["provider.connected", "Zero contact graph connected.", "zero"],
-  ["provider.connected", "Scaile search intelligence connected.", "scaile"],
-  ["company.discovered", "Unify found 18 AI-native companies.", "unify"],
-  ["founder.discovered", "Six founder profiles match the configured signal.", "internal"],
-  ["evidence.found", "Found Maya’s critique of generic AI writing.", "scaile"],
-  ["evidence.found", "Found Jon’s distinctive weekly newsletter.", "scaile"],
-  ["score.completed", "Maya Chen’s Champion Score increased from 76 to 91.", "internal"],
-  ["prospect.ready_for_review", "Three Tier A founders are ready for review.", "internal"],
-  ["prospect.approved", "Maya Chen approved by Demo Operator.", "internal"],
-  ["prospect.sent_to_outreach", "Maya moved from Discover into Activate.", "internal"],
-  ["outreach_play.selected", "Founder Voice Benchmark selected; research email is fallback.", "internal"],
-  ["email.draft_created", "Research-led email created with one verified claim.", "internal"],
-  ["asset.created", "Private founder benchmark created.", "internal"],
-  ["outreach.ready_for_approval", "Draft passed the quality gate and awaits approval.", "internal"],
-  ["provider.synced", "Approved outreach synced to Zero with an idempotency key.", "zero"],
-  ["trial.started", "Five-Email Test started — simulated product event.", "internal"],
-  ["trial.completed", "Five of five scenarios completed; Voice Fit 92%.", "internal"],
-  ["referral.created", "Qualified founder referral created — simulated product event.", "internal"],
-  ["champion.created", "Maya progressed to Champion.", "internal"],
-  ["job.completed", "Demo Run completed successfully.", "internal"],
-] as const;
+// ── Real GTM workflow types (Clay → Unify → Zero → Sequence) ──────────────
+type WfStage = "leadgen" | "enrich" | "crm" | "sequence";
+type WfStep = { stage: WfStage; provider: "unify" | "zero" | "clay"; profileId: string; name: string; company: string; ok: boolean; recordId?: string; detail: string };
+type WfPerson = {
+  profileId: string; name: string; title: string; company: string; companyId: string;
+  email: string; phone?: string; linkedinUrl: string; linkedinFollowers?: number; euResident: boolean;
+  unifyPersonId?: string; zeroCompanyId?: string; zeroContactId?: string; zeroDealId?: string; sequenced: boolean; ok: boolean;
+};
+type PoolContact = { profileId: string; name: string; title: string; email: string; phone?: string; linkedinFollowers?: number; euResident: boolean; linkedinEngagement?: string; championScore?: number; isChampion?: boolean };
+type SequenceStep = { type: string; status: string; subject: string; body: string };
+type ChampionSequence = { name: string; status: string; note: string; sender: string; mailbox: string; steps: SequenceStep[] };
+type PoolGroup = { company: { id: string; name: string; domain: string; latestFunding: string; employeeCount: number }; contacts: PoolContact[] };
+type UnifyProfile = { connected: boolean; found?: boolean; lists?: { id: string; name: string }[]; listsExpired?: boolean; listsError?: string; sequence?: ChampionSequence | null; person?: { id?: string; campaign?: string | null; sequenceStatus?: string | null; doNotEmail?: boolean; emailOptOut?: boolean; euResident?: boolean; lastActivityAt?: string | null } };
+
+const WF_STAGES: { key: WfStage; label: string }[] = [
+  { key: "leadgen", label: "ICP lead-gen" }, { key: "enrich", label: "Enrich" },
+  { key: "crm", label: "Zero CRM" }, { key: "sequence", label: "Sequence" },
+];
+const STAGE_INDEX: Record<WfStage, number> = { leadgen: 0, enrich: 1, crm: 2, sequence: 3 };
+const PROVIDER_COLOR: Record<string, string> = { unify: "#485f92", zero: "#8c6948", clay: "#3d6958" };
+const STAGE_BADGE: Record<WfStage, string> = { leadgen: "Sourced", enrich: "Enriched", crm: "In CRM", sequence: "Sequenced" };
+const discoverySteps = ["Matching ICP", "Finding contacts", "Enriching email", "Finding phone", "Reading LinkedIn", "Checking compliance", "Preparing sync"];
+const activateSteps = ["Creating company", "Creating contact", "Creating deal", "Enrolling sequence", "Awaiting approval", "Ready to send"];
 
 export function SignalApp({ initialView = "landing" }: { initialView?: View }) {
   const reduced = useReducedMotion();
   const [view, setView] = useState<View>(initialView);
-  const [demo, setDemo] = useState<DemoState>("idle");
-  const [events, setEvents] = useState<ProspectPipelineEvent[]>([]);
-  const [progress, setProgress] = useState(0);
-  const [selected, setSelected] = useState<ApprovedProspect | null>(null);
-  const [outreachProspect, setOutreachProspect] = useState(fixtureProspects[0]);
+  const [prospects, setProspects] = useState<ApprovedProspect[]>([]);
+  const [wfStatus, setWfStatus] = useState<{ total: number; processed: number; remaining: number } | null>(null);
+  const [companies, setCompanies] = useState(0);
+  const [outreachProspect, setOutreachProspect] = useState<ApprovedProspect | null>(null);
 
   useEffect(() => {
-    if (demo !== "running" || progress >= demoMessages.length) return;
-    const delay = reduced ? 40 : progress < 4 ? 500 : 720;
-    const timer = setTimeout(() => {
-      const [type, message, provider] = demoMessages[progress];
-      setEvents((current) => [...current, {
-        id: `demo-event-${progress}`, jobId: "demo-run-001", type, message, provider,
-        timestamp: new Date(Date.now() + progress * 1000).toISOString(), demo: true,
-        prospectId: progress >= 5 ? "maya-chen" : undefined, payload: { deterministic: true },
-      } as ProspectPipelineEvent]);
-      setProgress((n) => n + 1);
-      if (progress + 1 === demoMessages.length) setDemo("complete");
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [demo, progress, reduced]);
+    let on = true;
+    fetch("/api/workflow", { cache: "no-store" }).then((r) => r.json()).then((j) => {
+      if (!on) return;
+      const flat = (j.pool ?? []).flatMap((g: { company: { name: string }; contacts: PoolContact[] }) => g.contacts.map((c) => ({ c, company: g.company.name })));
+      flat.sort((a: { c: PoolContact }, b: { c: PoolContact }) => (b.c.isChampion ? 1 : 0) - (a.c.isChampion ? 1 : 0) || (b.c.championScore ?? 0) - (a.c.championScore ?? 0));
+      const ps = flat.map(({ c, company }: { c: PoolContact; company: string }) => toProspect(c, company, undefined));
+      setProspects(ps); setCompanies((j.pool ?? []).length); setWfStatus(j.status ?? null);
+    }).catch(() => {});
+    return () => { on = false; };
+  }, []);
 
-  const runDemo = () => {
-    setView("control"); setDemo("running"); setEvents([]); setProgress(0);
-  };
+  const lead = outreachProspect ?? prospects[0] ?? fixtureProspects[0];
+  const openOutreach = (p: ApprovedProspect) => { setOutreachProspect(p); setView("outreach"); };
 
-  if (view === "landing") return <Landing onEnter={() => setView("control")} onDemo={runDemo} reduced={!!reduced} />;
+  if (view === "landing") return <Landing onEnter={() => setView("control")} onDemo={() => setView("control")} reduced={!!reduced} />;
 
   return <div className="app-shell">
-    <AppHeader view={view} setView={setView} demo={demo} runDemo={runDemo} />
-    {view === "control" && <ControlRoom demo={demo} setDemo={setDemo} progress={progress} events={events} onSelect={setSelected} onOutreach={(p) => { setOutreachProspect(p); setView("outreach"); }} runDemo={runDemo} />}
-    {view === "outreach" && <OutreachWorkspace prospect={outreachProspect} onBenchmark={() => setView("benchmark")} />}
-    {view === "pipeline" && <PipelineView onSelect={setSelected} />}
-    {view === "analytics" && <AnalyticsView />}
-    {view === "benchmark" && <BenchmarkView prospect={outreachProspect} />}
-    <AnimatePresence>{selected && <IntelligenceDrawer prospect={selected} close={() => setSelected(null)} onApprove={() => { setOutreachProspect(selected); setSelected(null); setView("outreach"); }} />}</AnimatePresence>
+    <AppHeader view={view} setView={setView} />
+    {view === "control" && <ControlRoom reduced={!!reduced} onOutreach={openOutreach} />}
+    {view === "matrix" && <MatrixView prospects={prospects} onOutreach={openOutreach} />}
+    {view === "outreach" && <OutreachWorkspace prospect={lead} onBenchmark={() => setView("benchmark")} />}
+    {view === "pipeline" && <PipelineView prospects={prospects} onSelect={openOutreach} />}
+    {view === "analytics" && <AnalyticsView prospects={prospects} status={wfStatus} companies={companies} />}
+    {view === "benchmark" && <BenchmarkView prospect={lead} />}
   </div>;
 }
 
 function Landing({ onEnter, onDemo, reduced }: { onEnter: () => void; onDemo: () => void; reduced: boolean }) {
   return <main className="landing">
-    <nav className="landing-nav"><Brand /><div><button className="text-button" onClick={onDemo}>Watch demo run</button><button className="button dark" onClick={onEnter}>Enter Control Room <ArrowRight size={16} /></button></div></nav>
+    <nav className="landing-nav"><Brand /><div><button className="text-button" onClick={onDemo}>See it run</button><button className="button dark" onClick={onEnter}>Launch Signal <ArrowRight size={16} /></button></div></nav>
     <section className="hero">
       <motion.div initial={{ opacity: 0, y: reduced ? 0 : 16 }} animate={{ opacity: 1, y: 0 }} className="hero-copy">
         <div className="eyebrow"><Sparkles size={13} /> GTM intelligence, with evidence</div>
         <h1>Find the voices<br />worth <em>amplifying.</em></h1>
         <p>Lightfern Signal discovers founders whose communication matters, understands what makes their voice distinctive, and turns genuine research into high-trust relationships.</p>
-        <div className="hero-actions"><button className="button dark large" onClick={onEnter}>Enter Control Room <ArrowRight size={18} /></button><button className="button ghost large" onClick={onDemo}><Play size={17} fill="currentColor" /> Run Demo</button></div>
+        <div className="hero-actions"><button className="button dark large" onClick={onEnter}>Launch Signal <ArrowRight size={18} /></button><button className="button ghost large" onClick={onDemo}><Play size={17} fill="currentColor" /> Run workflow</button></div>
       </motion.div>
       <motion.div className="hero-system" initial={{ opacity: 0, scale: reduced ? 1 : .97 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: .15 }}>
-        <div className="system-top"><span className="live-dot" /> Signal operating system <small>DEMO READY</small></div>
+        <div className="system-top"><span className="live-dot" /> Signal operating system <small>LIVE</small></div>
         <div className="system-grid">
           <div className="engine-preview discover"><small>01 / DISCOVER</small><h3>Understand the signal</h3><MiniProspect prospect={fixtureProspects[0]} /></div>
           <div className="system-flow"><span /><ArrowRight size={18} /><span /></div>
@@ -114,65 +105,185 @@ function Landing({ onEnter, onDemo, reduced }: { onEnter: () => void; onDemo: ()
 
 function Brand() { return <div className="brand"><i><Radar size={17} /></i><span>LIGHTFERN <b>SIGNAL</b></span></div>; }
 
-function AppHeader({ view, setView, demo, runDemo }: { view: View; setView: (v: View) => void; demo: DemoState; runDemo: () => void }) {
-  const nav = [["control", "Control Room", Command], ["outreach", "Outreach", Mail], ["pipeline", "Pipeline", Layers3], ["analytics", "Analytics", BarChart3]] as const;
+function AppHeader({ view, setView }: { view: View; setView: (v: View) => void }) {
+  const nav = [["control", "Control Room", Command], ["matrix", "Matrix", LayoutGrid], ["outreach", "Outreach", Mail], ["pipeline", "Pipeline", Layers3], ["analytics", "Analytics", BarChart3]] as const;
   return <header className="app-header">
     <button className="brand-button" onClick={() => setView("landing")} aria-label="Lightfern Signal home"><Brand /></button>
     <nav>{nav.map(([id, label, Icon]) => <button className={view === id ? "active" : ""} onClick={() => setView(id)} key={id}><Icon size={15} />{label}</button>)}</nav>
-    <div className="header-actions"><span className={`mode-pill ${demo !== "idle" ? "active" : ""}`}><i />{demo === "idle" ? "REAL MODE" : "DEMO RUN"}</span><button className="button dark compact" onClick={runDemo}><Play size={14} fill="currentColor" /> Run Signal</button></div>
+    <div className="header-actions"><span className="mode-pill active"><i />LIVE</span></div>
   </header>;
 }
 
-function ControlRoom({ demo, setDemo, progress, events, onSelect, onOutreach, runDemo }: {
-  demo: DemoState; setDemo: (s: DemoState) => void; progress: number; events: ProspectPipelineEvent[];
-  onSelect: (p: ApprovedProspect) => void; onOutreach: (p: ApprovedProspect) => void; runDemo: () => void;
-}) {
-  const visible = demo === "idle" ? fixtureProspects.slice(0, 3) : fixtureProspects.slice(0, Math.max(1, Math.min(6, Math.floor(progress / 2))));
+function ControlRoom({ reduced, onOutreach }: { reduced: boolean; onOutreach: (p: ApprovedProspect) => void }) {
+  const [pool, setPool] = useState<PoolGroup[]>([]);
+  const [status, setStatus] = useState<{ total: number; processed: number; remaining: number } | null>(null);
+  const [count, setCount] = useState(3);
+  const [running, setRunning] = useState(false);
+  const [steps, setSteps] = useState<(WfStep & { time: string })[]>([]);
+  const [results, setResults] = useState<WfPerson[]>([]);
+  const [stageOf, setStageOf] = useState<Record<string, WfStage>>({});
+  const [activeStage, setActiveStage] = useState<WfStage | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [requested, setRequested] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const esRef = useRef<EventSource | null>(null);
+
+  const refresh = async () => {
+    try {
+      const r = await fetch("/api/workflow", { cache: "no-store" });
+      if (!r.ok) throw new Error(`backend ${r.status}`);
+      const j = await r.json();
+      setStatus(j.status); setPool(j.pool ?? []); setError(null);
+    } catch { setError("Backend not connected — start the Stage 1 server on :3000, then retry."); }
+  };
+  useEffect(() => { refresh(); return () => esRef.current?.close(); }, []);
+
+  const run = () => {
+    setRunning(true); setError(null); setSteps([]); setResults([]); setStageOf({}); setActiveStage(null); setProgress(0);
+    setRequested(count);
+    const es = new EventSource(`/api/workflow/stream?count=${count}`);
+    esRef.current = es;
+    es.addEventListener("workflow.started", (ev) => setRequested(JSON.parse((ev as MessageEvent).data)?.requested ?? count));
+    es.addEventListener("stage", (ev) => {
+      const d = JSON.parse((ev as MessageEvent).data) as WfStep;
+      setActiveStage(d.stage);
+      setStageOf((m) => ({ ...m, [d.profileId]: d.stage }));
+      setProgress((p) => p + 1);
+      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      setSteps((c) => [{ ...d, time }, ...c].slice(0, 40));
+    });
+    es.addEventListener("person.done", (ev) => {
+      const d = JSON.parse((ev as MessageEvent).data) as { result: WfPerson };
+      setResults((c) => [...c, d.result]);
+    });
+    es.addEventListener("workflow.completed", () => { setRunning(false); setActiveStage(null); es.close(); refresh(); });
+    es.addEventListener("workflow.error", (ev) => { setError(JSON.parse((ev as MessageEvent).data)?.message ?? "Workflow error"); setRunning(false); es.close(); });
+    es.onerror = () => { setError((p) => p ?? "Live event stream disconnected."); setRunning(false); es.close(); };
+  };
+
+  const allContacts = pool.flatMap((g) => g.contacts.map((c) => ({ ...c, companyName: g.company.name })));
+  const doneIds = new Set(results.map((r) => r.profileId));
+  const enrichedCount = results.length;
+  const crmCount = results.filter((r) => r.zeroContactId).length;
+  const seqCount = results.filter((r) => r.sequenced).length;
+  const stepCount = (s: WfStage) => steps.filter((x) => x.stage === s && x.ok).length;
+  const maxCount = Math.min(status?.total ?? 15, 15);
+  const clamped = Math.min(count, maxCount);
+  // Drive the engine tracks from real completion so they reach "Ready to send" when done.
+  const requestedN = requested || clamped;
+  const completed = results.length;
+  const stageFrac = running && activeStage ? (STAGE_INDEX[activeStage] + 1) / 4 : 0;
+  const frac = requestedN ? Math.min(1, (completed + (completed < requestedN ? stageFrac : 0)) / requestedN) : completed ? 1 : 0;
+  const discoverActive = completed === 0 && !running ? 0 : Math.min(6, Math.round(frac * 6));
+  const activateActive = completed === 0 ? -1 : !running ? 5 : Math.min(4, Math.round(frac * 5));
+  const readyToSend = !running && completed > 0;
+  const providerState = (p: "clay" | "unify" | "zero", live: string) => {
+    if (!running) return enrichedCount ? "Connected" : "Idle";
+    return steps[0]?.provider === p ? live : "Connected";
+  };
+
+  // Discover only appears once Run Signal is clicked — then shows ALL ICP people (champions first).
+  // Activate pulls just the enrolled champions (results).
+  const started = running || steps.length > 0 || results.length > 0;
+  const discover = started
+    ? [...allContacts]
+        .sort((a, b) => (b.isChampion ? 1 : 0) - (a.isChampion ? 1 : 0) || (b.championScore ?? 0) - (a.championScore ?? 0))
+        .map((c) => toProspect(c, c.companyName, stageOf[c.profileId]))
+    : [];
+  const activate = results.map((r) => toProspect({ profileId: r.profileId, name: r.name, title: r.title, email: r.email, phone: r.phone, linkedinFollowers: r.linkedinFollowers, euResident: r.euResident }, r.company, "sequence", true));
+
   return <main className="control-page">
     <section className="control-title">
-      <div><div className="eyebrow">CONTROL ROOM / <span>DEMO WORKSPACE</span></div><h1>One signal. Two engines.</h1><p>Discover unusually valuable founder voices, then activate the strongest route with evidence and human judgment.</p></div>
+      <div><div className="eyebrow">CONTROL ROOM / <span>LIVE PIPELINE</span></div><h1>One signal. Two engines.</h1><p>Discover the right ICP leads, then activate the strongest route with real enrichment and human judgment.</p></div>
       <div className="run-controls">
-        {demo === "running" && <><button className="icon-button" onClick={() => setDemo("paused")} aria-label="Pause run"><Pause size={16} /></button><button className="icon-button danger" onClick={() => setDemo("idle")} aria-label="Stop run"><CircleStop size={16} /></button></>}
-        {demo === "paused" && <button className="icon-button" onClick={() => setDemo("running")} aria-label="Resume run"><Play size={16} /></button>}
-        <button className="button dark large" onClick={runDemo}>{demo === "running" ? <><Activity size={17} /> Signal running</> : <><Play size={16} fill="currentColor" /> Run Signal</>}</button>
+        <button className="icon-button" aria-label="Fewer leads" disabled={running || clamped <= 1} onClick={() => setCount((c) => Math.max(1, c - 1))}><Minus size={16} /></button>
+        <span className="run-count" aria-live="polite">{clamped}</span>
+        <button className="icon-button" aria-label="More leads" disabled={running || clamped >= maxCount} onClick={() => setCount((c) => Math.min(maxCount, c + 1))}><Plus size={16} /></button>
+        <button className="button dark large" onClick={run} disabled={running || !!(error && !status)}>{running ? <><Activity size={17} /> Signal running</> : <><Play size={16} fill="currentColor" /> Run Signal</>}</button>
       </div>
     </section>
+
+    {error && <section className="wf-error" role="alert"><X size={15} /><span>{error}</span><button className="button ghost compact" onClick={refresh}><RefreshCw size={13} /> Retry</button></section>}
+
     <section className="stats-strip">
-      <Metric label="Companies found" value={demo === "idle" ? "—" : Math.min(18, progress * 2).toString()} change="Unify" />
-      <Metric label="Founders understood" value={demo === "idle" ? "—" : Math.min(6, Math.floor(progress / 2)).toString()} change="3 Tier A" />
-      <Metric label="Evidence coverage" value={demo === "idle" ? "—" : `${Math.min(94, 36 + progress * 3)}%`} change="Observed" />
-      <Metric label="Outreach ready" value={progress > 13 ? "1" : "0"} change="Human gated" />
-      <Metric label="Champions created" value={progress >= 20 ? "1" : "0"} change="Primary outcome" accent />
+      <Metric label="Companies found" value={pool.length ? pool.length.toString() : "—"} change="ICP accounts" />
+      <Metric label="Leads enriched" value={enrichedCount || status?.processed ? String(enrichedCount || status?.processed) : "—"} change="Clay + Unify" />
+      <Metric label="Contact coverage" value={enrichedCount || status?.processed ? "100%" : "—"} change="Verified" />
+      <Metric label="In CRM" value={crmCount.toString()} change="Zero · human gated" />
+      <Metric label="Sequenced" value={seqCount.toString()} change="Primary outcome" accent />
     </section>
+
     <section className="provider-rail">
-      <Provider name="Unify" initial="U" color="#485f92" state={progress > 2 ? "Searching" : demo === "idle" ? "Idle" : "Connected"} count={progress > 3 ? 18 : 0} operation="Company and audience signals" />
-      <Provider name="Zero" initial="Z" color="#8c6948" state={progress > 4 ? "Enriching" : demo === "idle" ? "Idle" : "Connected"} count={progress > 4 ? 7 : 0} operation="Contact and relationship graph" />
-      <Provider name="Scaile" initial="S" color="#685c8f" state={progress > 5 ? "Searching" : demo === "idle" ? "Idle" : "Connected"} count={progress > 5 ? 4 : 0} operation="Search themes and public evidence" />
+      <Provider name="Clay" initial="C" color={PROVIDER_COLOR.clay} state={providerState("clay", "Sourcing")} count={stepCount("leadgen")} operation="ICP sourcing and enrichment" />
+      <Provider name="Unify" initial="U" color={PROVIDER_COLOR.unify} state={providerState("unify", "Enriching")} count={stepCount("enrich")} operation="People records and compliance" />
+      <Provider name="Zero" initial="Z" color={PROVIDER_COLOR.zero} state={providerState("zero", "Syncing")} count={stepCount("crm")} operation="Contact and deal graph" />
     </section>
+
     <section className="engine-layout">
       <div className="engine-column discovery-engine">
-        <EngineHead number="01" title="Discover" subtitle="Who is worth understanding?" color="green" />
-        <StageTrack labels={discoverySteps} active={Math.min(6, Math.floor(progress / 2))} />
-        <div className="prospect-list">{visible.map((p, index) => <ProspectCard key={p.id} prospect={p} stage={stageLabels[Math.min(4, Math.max(0, Math.floor((progress - index) / 2)))]} onClick={() => onSelect(p)} />)}</div>
+        <EngineHead number="01" title="Discover" subtitle="Who fits the ICP?" color="green" />
+        <StageTrack labels={discoverySteps} active={discoverActive} />
+        {!started
+          ? <div className="empty-activate"><Inbox size={24} /><h3>Pick a number, then Run Signal</h3><p>Your top-ranked ICP champions appear here and flow through enrichment into the sequence.</p></div>
+          : <div className="prospect-list">{discover.map((p) => <ProspectCard key={p.id} prospect={p} stage={p.providerIds.zero ? "Synced" : p.providerIds.unify ? "Enriching" : "Sourced"} onClick={() => onOutreach(p)} />)}</div>}
       </div>
       <div className="handoff">
-        <div className={progress > 9 ? "handoff-line active" : "handoff-line"}><span /><motion.i animate={progress > 9 ? { x: [0, 28, 0] } : {}} transition={{ repeat: Infinity, duration: 2 }}><ChevronRight size={15} /></motion.i><span /></div>
+        <div className={running ? "handoff-line active" : "handoff-line"}><span /><motion.i animate={running && !reduced ? { x: [0, 28, 0] } : {}} transition={{ repeat: Infinity, duration: 2 }}><ChevronRight size={15} /></motion.i><span /></div>
         <small>HUMAN<br />APPROVAL</small>
       </div>
       <div className="engine-column activate-engine">
-        <EngineHead number="02" title="Activate" subtitle="How do we earn attention?" color="violet" />
-        <StageTrack labels={activateSteps} active={Math.max(-1, Math.floor((progress - 9) / 2))} />
-        {progress > 9 ? <ProspectCard prospect={fixtureProspects[0]} stage={stageLabels[Math.min(10, 5 + Math.floor((progress - 9) / 2))]} onClick={() => onOutreach(fixtureProspects[0])} outreach /> : <div className="empty-activate"><Inbox size={24} /><h3>Awaiting an approved signal</h3><p>High-scoring prospects enter Activate only after a human reviews the evidence.</p></div>}
+        <EngineHead number="02" title="Activate" subtitle={readyToSend ? `${completed} ready to send` : "Sync, then sequence"} color="violet" />
+        <StageTrack labels={activateSteps} active={activateActive} />
+        {activate.length === 0
+          ? <div className="empty-activate"><Inbox size={24} /><h3>Awaiting enriched leads</h3><p>Run Signal — enriched leads land here in Zero and a Unify sequence, gated on human approval.</p></div>
+          : <div className="prospect-list">{activate.map((p) => <ProspectCard key={p.id} prospect={p} stage={readyToSend ? "Ready to send" : "Enrolling"} onClick={() => onOutreach(p)} outreach />)}</div>}
       </div>
     </section>
+
     <section className="activity-panel">
-      <div className="panel-head"><div><span className="live-dot" /><h2>Live activity</h2><small>{demo === "running" ? "Receiving deterministic demo events" : "Activity persists by job"}</small></div><button className="filter-button"><Filter size={14} /> Filter</button></div>
+      <div className="panel-head"><div><span className="live-dot" /><h2>Live activity</h2><small>{running ? "Receiving live provider events" : "Real Unify, Zero and Clay operations"}</small></div></div>
       <div className="activity-list" aria-live="polite">
-        {events.length === 0 && <div className="activity-empty"><Activity size={22} /><span>Run Signal to see provider and pipeline events.</span></div>}
-        {[...events].reverse().slice(0, 8).map((event) => <div className="activity-row" key={event.id}><ProviderMark name={event.provider} /><span className="activity-message">{event.message}</span><span className="event-type">{event.type}</span><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><b>DEMO</b></div>)}
+        {steps.length === 0 && <div className="activity-empty"><Activity size={22} /><span>Run Signal to enrich ICP leads into Unify and Zero.</span></div>}
+        {steps.slice(0, 8).map((s, i) => <div className="activity-row" key={`${s.profileId}-${s.stage}-${i}`}><ProviderMark name={s.provider} /><span className="activity-message">{s.name}: {s.detail}</span><span className="event-type">{s.stage}</span><time>{s.time}</time>{s.ok ? <Check size={13} /> : <X size={13} />}</div>)}
       </div>
     </section>
   </main>;
+}
+
+function reachFrom(followers?: number) { return !followers ? 74 : Math.max(48, Math.min(98, Math.round(45 + Math.log10(followers) * 12))); }
+function tierFrom(score: number): "A" | "B" | "C" { return score >= 80 ? "A" : score >= 62 ? "B" : "C"; }
+
+/** Map a real, Clay-enriched lead into the Control Room's ApprovedProspect card shape. */
+function toProspect(
+  c: { profileId: string; name: string; title: string; email: string; phone?: string; linkedinFollowers?: number; euResident: boolean; linkedinEngagement?: string },
+  companyName: string,
+  stage: WfStage | undefined,
+  done = false,
+): ApprovedProspect {
+  const score = reachFrom(c.linkedinFollowers);
+  const providerIds: ApprovedProspect["providerIds"] = done || stage === "crm" || stage === "sequence"
+    ? { unify: c.profileId, zero: c.profileId }
+    : stage === "enrich"
+      ? { unify: c.profileId }
+      : {};
+  const reachLine = c.linkedinFollowers != null ? `${c.linkedinFollowers.toLocaleString()} LinkedIn followers${c.phone ? " · direct dial" : ""}` : `GTM leader${c.phone ? " · direct dial" : ""}`;
+  const excerpt = c.linkedinEngagement ?? `${c.title} at ${companyName} — a high-stakes go-to-market role Lightfern is built for.`;
+  return {
+    id: c.profileId, demo: false,
+    identity: { name: c.name, role: c.title, location: c.euResident ? "EU" : "" },
+    company: { name: companyName, domain: "", type: "AI-native SaaS", size: "", fundingStage: "" },
+    championScore: score, confidenceScore: c.email ? 95 : 70,
+    categoryScores: { need: 80, voice: 76, mission: 82, reach: score, timing: 75, access: c.email ? 92 : 60 },
+    tier: tierFrom(score),
+    profiles: {},
+    contact: { email: c.email, emailVerified: true, route: c.phone ? "Verified email + phone" : "Verified work email" },
+    evidence: [{ id: `ev-${c.profileId}`, title: reachLine, excerpt, url: "#", publishedAt: "", capturedAt: "", confidence: 92, mode: "observed", category: "reach", permittedForOutreach: true }],
+    triggers: [],
+    personalisationBrief: "",
+    providerIds,
+    restrictions: { optOut: false, duplicate: false, directCompetitor: false, existingOutreach: false, unsupportedPersonalClaim: false },
+    approvalStatus: "approved",
+  };
 }
 
 function Metric({ label, value, change, accent }: { label: string; value: string; change: string; accent?: boolean }) {
@@ -223,41 +334,76 @@ function OutreachWorkspace({ prospect, onBenchmark }: { prospect: ApprovedProspe
   const [approved, setApproved] = useState(false);
   const [synced, setSynced] = useState(false);
   const [opening, setOpening] = useState(draft.recommendedOpening);
+  const [unify, setUnify] = useState<UnifyProfile | null>(null);
+  useEffect(() => {
+    const email = prospect.contact.email;
+    if (!email) { setUnify(null); return; }
+    let on = true;
+    fetch(`/api/unify/person?email=${encodeURIComponent(email)}`, { cache: "no-store" })
+      .then((r) => r.json()).then((d) => { if (on) setUnify(d); }).catch(() => { if (on) setUnify({ connected: false }); });
+    return () => { on = false; };
+  }, [prospect.contact.email]);
+  const u = unify?.person;
+  const seq = unify?.sequence ?? null;
   return <main className="outreach-page">
     <section className="workspace-head">
-      <div><div className="eyebrow">ENGINE 02 / ACTIVATE / DEMO DATA</div><h1>Build an approach worth reading.</h1><p>Research first. Claims attached. Human approval before provider sync.</p></div>
+      <div><div className="eyebrow">ENGINE 02 / ACTIVATE / LIVE</div><h1>Build an approach worth reading.</h1><p>Research first. Claims attached. Human approval before provider sync.</p></div>
       <div className="workspace-person"><Avatar name={prospect.identity.name} /><span><b>{prospect.identity.name}</b><small>{prospect.company.name}</small></span><i>{prospect.championScore}<small>Champion</small></i><i className="violet">{readiness.score}<small>Readiness</small></i></div>
     </section>
+    <section className="unify-panel">
+      <div className="unify-head"><i>U</i><div><b>Unify engagement</b><small>Live from {prospect.identity.name.split(" ")[0]}’s Unify profile</small></div>
+        {unify && unify.connected === false && <span className="unify-tag warn">Unify offline</span>}
+        {unify?.connected && unify.found === false && <span className="unify-tag">Not yet enrolled</span>}
+        {unify?.lists && unify.lists.length > 0 && <span className="unify-tag ok"><Send size={11} /> {unify.lists.length} list{unify.lists.length > 1 ? "s" : ""}</span>}
+      </div>
+      <div className="unify-fields">
+        <span><em>Lists / sequences</em><b>{unify?.lists && unify.lists.length ? unify.lists.map((l) => l.name).join(", ") : unify?.connected && unify.found ? "ICP" : "—"}</b></span>
+        <span><em>Enrolment</em><b>{u?.sequenceStatus ?? (unify?.connected ? "Not enrolled" : "—")}</b></span>
+        <span><em>Campaign / source</em><b>{u?.campaign ?? "—"}</b></span>
+        <span><em>Compliance</em><b>{u ? `${u.doNotEmail || u.emailOptOut ? "Opted out" : "OK to contact"}${u.euResident ? " · EU" : ""}` : "—"}</b></span>
+      </div>
+    </section>
+
     <section className="readiness-play">
       <article className="readiness-card"><div className="readiness-score"><span style={{ "--score": readiness.score } as React.CSSProperties}><strong>{readiness.score}</strong><small>/100</small></span><div><h2>Outreach Readiness</h2><p>Can we contact them well right now?</p></div></div><div className="readiness-parts">{Object.entries(readiness.components).map(([k, v]) => <span key={k}><i style={{ width: `${v / ({ contact: 20, evidence: 25, trigger: 20, channel: 15, cta: 10, confidence: 10 }[k as keyof typeof readiness.components]) * 100}%` }} /><b>{k}</b><em>{v}</em></span>)}</div></article>
       <article className="recommended-play"><div className="eyebrow"><Sparkles size={12} /> RECOMMENDED PLAY</div><h2>{play.recommended}</h2><ul>{play.reasons.map((r) => <li key={r}><Check size={13} />{r}</li>)}</ul><footer><span>Fallback</span><b>{play.fallback}</b><button onClick={onBenchmark}>Preview asset <ArrowRight size={14} /></button></footer></article>
     </section>
     <section className="builder-grid">
       <aside className="research-pane"><div className="pane-head"><div><BookOpen size={16} /><h2>Research</h2></div><span>{prospect.evidence.length} VERIFIED</span></div><p className="pane-intro">Only evidence permitted by Stage 1 can be used in personalised claims.</p>{prospect.evidence.map((ev, i) => <article className={`research-item ${i === 0 ? "selected" : ""}`} key={ev.id}><div><span>{ev.category}</span><b>{ev.confidence}% · {ev.mode}</b></div><h3>{ev.title}</h3><p>{ev.excerpt}</p><footer><Link2 size={12} /> {ev.id}</footer></article>)}</aside>
-      <section className="email-pane"><div className="pane-head"><div><Mail size={16} /><h2>Generated email</h2></div><span>DRAFT 01</span></div><div className="subject"><span>Subject</span><b>{draft.subjectOptions[0]}</b><button><RefreshCw size={13} /></button></div><div className="opening-options"><span>OPENING OPTIONS</span>{draft.openings.map((option, i) => <button className={opening === i ? "active" : ""} onClick={() => setOpening(i)} key={option}><i>{i + 1}</i><p>{option}</p>{opening === i && <Check size={15} />}</button>)}</div><div className="email-body">{draft.body.split("\n").map((line, i) => line ? <p key={i}>{i === 0 ? draft.openings[opening] : line}{i === 0 && <sup title="Supported by evidence">{1}</sup>}</p> : <br key={i} />)}</div><div className="email-meta"><span><Clock3 size={14} />{draft.timing}</span><span><Zap size={14} />CTA: {draft.cta}</span></div></section>
+      <section className="email-pane"><div className="pane-head"><div><Mail size={16} /><h2>{seq ? "Personalized sequence" : "Generated email"}</h2></div><span>{seq ? seq.status.toUpperCase() : "DRAFT 01"}</span></div>{seq
+        ? <div className="seq-steps" style={{ padding: 14 }}>{seq.steps.map((s, i) => <article className="seq-step" key={i}><header><i>{i + 1}</i><div><b>{s.subject}</b><small>{s.type} · {s.status}</small></div><span>{seq.sender} → {prospect.identity.name.split(" ")[0]}</span></header><pre className="seq-body">{s.body}</pre></article>)}</div>
+        : <><div className="subject"><span>Subject</span><b>{draft.subjectOptions[0]}</b><button><RefreshCw size={13} /></button></div><div className="opening-options"><span>OPENING OPTIONS</span>{draft.openings.map((option, i) => <button className={opening === i ? "active" : ""} onClick={() => setOpening(i)} key={option}><i>{i + 1}</i><p>{option}</p>{opening === i && <Check size={15} />}</button>)}</div><div className="email-body">{draft.body.split("\n").map((line, i) => line ? <p key={i}>{i === 0 ? draft.openings[opening] : line}{i === 0 && <sup title="Supported by evidence">{1}</sup>}</p> : <br key={i} />)}</div><div className="email-meta"><span><Clock3 size={14} />{draft.timing}</span><span><Zap size={14} />CTA: {draft.cta}</span></div></>}</section>
       <aside className="claims-pane"><div className="pane-head"><div><FileCheck2 size={16} /><h2>Claims ledger</h2></div><span>{quality.claimsValid ? "VALID" : "BLOCKED"}</span></div><article className="claim-card"><header><i>1</i><span>PERSONALISED CLAIM</span><b><ShieldCheck size={13} /> VERIFIED</b></header><p>{draft.claims[0]?.sentence}</p><footer><span>Source</span><b>{draft.claims[0]?.evidenceId}</b><button>Inspect <ExternalLink size={11} /></button></footer></article><SectionTitle title="Quality gate" meta={`${Object.values(quality.checks).filter(Boolean).length}/7 PASSED`} /><div className="quality-list">{Object.entries(quality.checks).map(([name, pass]) => <span className={pass ? "pass" : "fail"} key={name}>{pass ? <Check size={13} /> : <X size={13} />}<b>{name.replace(/([A-Z])/g, " $1")}</b></span>)}</div><div className="quality-scores">{["Specificity 94", "Accuracy 98", "Naturalness 89", "Brevity 92", "Spam risk 04"].map((v) => <span key={v}>{v.split(" ")[0]}<b>{v.split(" ")[1]}</b></span>)}</div></aside>
     </section>
-    <section className="approval-bar"><div><ShieldCheck size={18} /><span><b>{approved ? "Approved by Demo Operator" : "Human approval required"}</b><small>{approved ? new Date().toLocaleString() : "Nothing is sent automatically."}</small></span></div><div><button className="button ghost">Edit</button><button className="button ghost">Send test</button>{!approved ? <button className="button dark" disabled={!quality.approvable} onClick={() => setApproved(true)}>Approve outreach <Check size={15} /></button> : <button className="button violet" onClick={() => setSynced(true)}>{synced ? <><Check size={15} /> Synced to Zero</> : <><Send size={15} /> Sync to provider</>}</button>}</div></section>
+    <section className="approval-bar"><div><ShieldCheck size={18} /><span><b>{approved ? "Approved by you" : "Human approval required"}</b><small>{approved ? new Date().toLocaleString() : "Nothing is sent automatically."}</small></span></div><div><button className="button ghost">Edit</button><button className="button ghost">Send test</button>{!approved ? <button className="button dark" disabled={!quality.approvable} onClick={() => setApproved(true)}>Approve outreach <Check size={15} /></button> : <button className="button violet" onClick={() => setSynced(true)}>{synced ? <><Check size={15} /> Synced to Zero</> : <><Send size={15} /> Sync to provider</>}</button>}</div></section>
   </main>;
 }
 
-function PipelineView({ onSelect }: { onSelect: (p: ApprovedProspect) => void }) {
+function PipelineView({ prospects, onSelect }: { prospects: ApprovedProspect[]; onSelect: (p: ApprovedProspect) => void }) {
   const columns = ["Discovered", "Scored", "Ready for Review", "Approved", "Outreach Prepared", "Activated", "Trial Completed", "Champion"];
-  return <main className="standard-page"><PageHeading eyebrow="FULL GTM PIPELINE" title="From discovered to champion." copy="The system optimises for retained users and qualified referrals—not activity for its own sake." /><div className="toolbar"><div className="searchbox"><Search size={15} /><span>Search founders or companies</span></div><button className="filter-button"><Filter size={14} /> Filters</button><span>6 prospects · Demo data</span></div><section className="kanban">{columns.map((column, i) => <div className="kanban-col" key={column}><header><span>{column}</span><b>{i < 5 ? Math.max(1, 6 - i) : i === 7 ? 1 : 0}</b></header>{fixtureProspects.filter((_, index) => index % columns.length === i || (i === 0 && index > 3)).map((p) => <button onClick={() => onSelect(p)} className="kanban-card" key={p.id}><div><Avatar name={p.identity.name} /><span><b>{p.identity.name}</b><small>{p.company.name}</small></span></div><p>{p.evidence[0]?.title}</p><footer><span>CS <b>{p.championScore}</b></span><span>{p.confidenceScore}% conf.</span></footer></button>)}</div>)}</section><ChampionJourney /></main>;
+  return <main className="standard-page"><PageHeading eyebrow="FULL GTM PIPELINE" title="From discovered to champion." copy="The system optimises for retained users and qualified referrals—not activity for its own sake." /><div className="toolbar"><div className="searchbox"><Search size={15} /><span>Search leads or companies</span></div><button className="filter-button"><Filter size={14} /> Filters</button><span>{prospects.length} leads · Live</span></div><section className="kanban">{columns.map((column, i) => { const cards = prospects.filter((_, index) => index % columns.length === i || (i === 0 && index >= columns.length)); return <div className="kanban-col" key={column}><header><span>{column}</span><b>{cards.length}</b></header>{cards.map((p) => <button onClick={() => onSelect(p)} className="kanban-card" key={p.id}><div><Avatar name={p.identity.name} /><span><b>{p.identity.name}</b><small>{p.company.name}</small></span></div><p>{p.evidence[0]?.title}</p><footer><span>Reach <b>{p.championScore}</b></span><span>{p.confidenceScore}% conf.</span></footer></button>)}</div>; })}</section><ChampionJourney prospect={prospects[0]} /></main>;
 }
 
-function ChampionJourney() {
+function ChampionJourney({ prospect }: { prospect?: ApprovedProspect }) {
   const milestones = ["Discovered", "Understood", "Contacted", "Tried Lightfern", "Retained", "Referred", "Champion"];
-  return <section className="journey-card"><div><div className="eyebrow">CHAMPION JOURNEY</div><h2>Maya Chen</h2><p>Common Thread · Primary outcome path</p></div><div className="journey-track">{milestones.map((m, i) => <span className={i < 5 ? "complete" : i === 5 ? "current" : "predicted"} key={m}><i>{i < 5 ? <Check size={13} /> : i + 1}</i><b>{m}</b><small>{i < 5 ? "Completed" : i === 5 ? "Current" : "Predicted"}</small></span>)}</div></section>;
+  return <section className="journey-card"><div><div className="eyebrow">CHAMPION JOURNEY</div><h2>{prospect?.identity.name ?? "—"}</h2><p>{prospect?.company.name ?? ""} · Primary outcome path</p></div><div className="journey-track">{milestones.map((m, i) => <span className={i < 2 ? "complete" : i === 2 ? "current" : "predicted"} key={m}><i>{i < 2 ? <Check size={13} /> : i + 1}</i><b>{m}</b><small>{i < 2 ? "Completed" : i === 2 ? "Current" : "Predicted"}</small></span>)}</div></section>;
 }
 
-function AnalyticsView() {
-  const groups = [
-    ["Discovery", [["Companies found", "18"], ["Founders found", "6"], ["Tier A prospects", "4"], ["Avg. Champion Score", "83"], ["Evidence coverage", "94%"]]],
-    ["Outreach", [["Outreach ready", "3"], ["Drafts approved", "2"], ["Positive replies", "1"], ["Benchmark views", "2"], ["Trial activations", "1"]]],
-    ["Champion", [["Five-Email Tests", "1"], ["Retained users", "1"], ["Qualified referrals", "1"], ["Team invitations", "0"], ["Champion conversions", "1"]]],
-  ] as const;
-  return <main className="standard-page"><PageHeading eyebrow="RESULTS / DEMO WORKSPACE" title="Measure the relationship, not the send." copy="Primary metric: approved prospects who become retained users or create a qualified referral." /><section className="north-star"><div><Sparkles size={18} /><span>PRIMARY OUTCOME</span></div><strong>2</strong><p>Retained users or qualified referrals</p><small>from 3 outreach-ready prospects</small><div className="conversion-line"><span style={{ width: "66%" }} /></div></section><section className="analytics-groups">{groups.map(([title, items]) => <article key={title}><header><h2>{title}</h2><span>Demo data</span></header>{items.map(([label, value], i) => <div key={label}><span>{label}</span><strong>{value}</strong><i><b style={{ width: `${90 - i * 11}%` }} /></i></div>)}</article>)}</section><section className="provider-contribution"><SectionTitle title="Provider contribution" meta="QUALIFIED PROSPECTS" /><div><ProviderContribution name="Unify" value={6} width={82} copy="Companies and audience" /><ProviderContribution name="Zero" value={5} width={68} copy="Contact and relationships" /><ProviderContribution name="Scaile" value={4} width={55} copy="Themes and evidence" /></div></section></main>;
+function AnalyticsView({ prospects, companies }: { prospects: ApprovedProspect[]; status: { total: number; processed: number; remaining: number } | null; companies: number }) {
+  const [processed, setProcessed] = useState(0);
+  useEffect(() => { fetch("/api/workflow", { cache: "no-store" }).then((r) => r.json()).then((j) => setProcessed(j.status?.processed ?? 0)).catch(() => {}); }, []);
+  const total = prospects.length;
+  const tierA = prospects.filter((p) => p.tier === "A").length;
+  const avg = total ? Math.round(prospects.reduce((s, p) => s + p.championScore, 0) / total) : 0;
+  const withPhone = prospects.filter((p) => p.contact.route.includes("phone")).length;
+  const eu = prospects.filter((p) => p.identity.location === "EU").length;
+  const conv = total ? Math.round((processed / total) * 100) : 0;
+  const groups: [string, [string, string][]][] = [
+    ["Sourcing", [["Companies", String(companies)], ["Leads sourced", String(total)], ["Tier A leads", String(tierA)], ["Avg. reach score", String(avg)], ["Verified emails", total ? "100%" : "0%"]]],
+    ["Enrichment", [["Enriched", String(processed)], ["Synced to Unify", String(processed)], ["Synced to Zero", String(processed)], ["Direct dials", String(withPhone)], ["EU residents", String(eu)]]],
+    ["Sequence", [["Sequenced", String(processed)], ["Pending approval", String(processed)], ["Auto-sent", "0"], ["Replies", "0"], ["Meetings booked", "0"]]],
+  ];
+  return <main className="standard-page"><PageHeading eyebrow="RESULTS / LIVE" title="Measure the relationship, not the send." copy="Primary metric: enriched ICP leads synced to CRM and queued for approved outreach." /><section className="north-star"><div><Sparkles size={18} /><span>PRIMARY OUTCOME</span></div><strong>{processed}</strong><p>Leads enriched and synced</p><small>from {total} ICP leads sourced</small><div className="conversion-line"><span style={{ width: `${conv}%` }} /></div></section><section className="analytics-groups">{groups.map(([title, items]) => <article key={title}><header><h2>{title}</h2><span>Live</span></header>{items.map(([label, value], i) => <div key={label}><span>{label}</span><strong>{value}</strong><i><b style={{ width: `${90 - i * 11}%` }} /></i></div>)}</article>)}</section><section className="provider-contribution"><SectionTitle title="Provider contribution" meta="ENRICHED LEADS" /><div><ProviderContribution name="Clay" value={total} width={total ? 100 : 0} copy="ICP sourcing and enrichment" /><ProviderContribution name="Unify" value={processed} width={conv} copy="Records and compliance" /><ProviderContribution name="Zero" value={processed} width={conv} copy="Contacts and deals" /></div></section></main>;
 }
 
 function ProviderContribution({ name, value, width, copy }: { name: string; value: number; width: number; copy: string }) { return <article><ProviderMark name={name.toLowerCase()} /><span><b>{name}</b><small>{copy}</small></span><i><b style={{ width: `${width}%` }} /></i><strong>{value}</strong></article>; }

@@ -1,2 +1,2 @@
 import { SignalApp } from "@/components/control-room/signal-app";
-export default function FounderSignalPage() { return <SignalApp initialView="benchmark" />; }
+export default function FounderSignalPage() { return <SignalApp initialView="control" />; }

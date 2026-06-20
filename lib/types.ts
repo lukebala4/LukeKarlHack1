@@ -175,7 +175,7 @@ export const UnifiedProspectSchema = z.object({
   personalization: PersonalizationBriefSchema.optional(),
   status: ProspectStatusSchema,
   provenance: z.array(ProvenanceSchema).default([]),
-  // provider-specific ids, populated on sync
+  // provider-specific ids, populated on enrich/sync
   zeroContactId: z.string().optional(),
   zeroCompanyId: z.string().optional(),
   zeroDealId: z.string().optional(),
