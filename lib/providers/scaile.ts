@@ -79,17 +79,20 @@ export async function status(): Promise<ProviderStatus> {
   if (!providerConfigured.scaile()) {
     return { provider: "scaile", state: "not_configured", capabilities: { read: false, write: false }, supportedFunctions: ["AI-search query map", "content briefs (dashboard-driven)"], lastChecked, detail: "SCAILE_API_BASE not set." };
   }
-  // Probe the articles endpoint; classify SPA-HTML as unreachable (wrong/forbidden host).
+  // Probe the articles endpoint. GET /articles returns 405 (POST-only) on the live API —
+  // that's a reachable+authed signal. Non-JSON (SPA HTML) = wrong host; 401/403 = bad key.
   const probe = await call("GET", "/articles");
   if (!probe.isJson) {
     return { provider: "scaile", state: "unreachable", capabilities: { read: false, write: false }, supportedFunctions: ["AI-search query map", "content briefs (dashboard-driven)"], lastChecked, detail: "Host returns SPA HTML, not API JSON. Set SCAILE_API_BASE to the real backend host (DevTools → Network)." };
   }
+  const authFailed = probe.status === 401 || probe.status === 403;
+  const reachableAuthed = probe.status === 200 || probe.status === 405; // 405 = method-not-allowed on a real, authed endpoint
   return {
     provider: "scaile",
-    state: probe.status === 401 ? "auth_failed" : probe.ok ? "connected" : "unreachable",
-    capabilities: { read: probe.ok, write: probe.ok },
+    state: authFailed ? "auth_failed" : reachableAuthed ? "connected" : "unreachable",
+    capabilities: { read: reachableAuthed, write: reachableAuthed },
     supportedFunctions: ["articles (generate/poll)", "AI-search visibility", "content engine"],
     lastChecked,
-    detail: probe.ok ? "API reachable (JSON)" : probe.error,
+    detail: authFailed ? "Key rejected (401/403)" : reachableAuthed ? "Live API reachable + authenticated" : probe.error,
   };
 }

@@ -13,6 +13,7 @@
 import { env } from "@/lib/env";
 import { recommendChannel, scoreProspect } from "@/lib/scoring";
 import { SEED, type RawSeed } from "@/lib/seed";
+import { CLAY } from "@/lib/clay";
 import type {
   CostLedgerEntry,
   PersonalizationBrief,
@@ -29,14 +30,27 @@ function prov(field: string, value: any, partial: Partial<Provenance> = {}): Pro
   };
 }
 
-function inferEmail(seed: RawSeed): { email?: string; provenance?: Provenance } {
-  if (!seed.emailPattern || !seed.domain) return {};
+function resolveEmail(seed: RawSeed): { email?: string; verified: boolean; provider: string; provenance?: Provenance } {
+  // Live source (Clay): real verified email.
+  if (seed.verifiedEmail) {
+    const provider = seed.source ?? "clay";
+    return {
+      email: seed.verifiedEmail,
+      verified: true,
+      provider,
+      provenance: prov("email", seed.verifiedEmail, { provider, sourceType: "api_enrichment", observed: true, verified: true, confidence: 0.95 }),
+    };
+  }
+  // Curated seed: pattern-inferred, unverified.
+  if (!seed.emailPattern || !seed.domain) return { verified: false, provider: "inference" };
   const [first, ...rest] = seed.name.toLowerCase().split(" ");
   const last = rest.pop() ?? "";
   const local = seed.emailPattern === "first" ? first : `${first}.${last}`;
   const email = `${local}@${seed.domain}`;
   return {
     email,
+    verified: false,
+    provider: "inference",
     provenance: prov("email", email, { provider: "inference", sourceType: "pattern_inference", observed: false, verified: false, confidence: 0.35 }),
   };
 }
@@ -104,20 +118,26 @@ export function runPipeline(opts?: { enrichMin?: number; championMin?: number })
   let enriched = 0;
   const tiers: Record<string, number> = { A: 0, B: 0, C: 0, D: 0 };
 
-  // Stage 1 — discovery (cheap, curated)
-  ledger.push({ provider: "seed", operation: "discover ICP accounts+people", timestamp: now(), success: true, cacheStatus: "hit", retryCount: 0, note: `${SEED.length} candidates` });
+  // Stage 1 — discovery (Clay live + curated)
+  const ALL = [...CLAY, ...SEED];
+  ledger.push({ provider: "clay", operation: "discover+enrich ICP people (live)", timestamp: now(), success: true, cacheStatus: "miss", retryCount: 0, note: `${CLAY.length} live Clay-enriched contacts` });
+  ledger.push({ provider: "seed", operation: "discover ICP accounts+people (curated)", timestamp: now(), success: true, cacheStatus: "hit", retryCount: 0, note: `${SEED.length} curated candidates` });
 
-  for (const seed of SEED) {
+  for (const seed of ALL) {
+    const srcProvider = seed.source ?? "seed";
+    const srcType = seed.source ? ("api_enrichment" as const) : ("curated_seed" as const);
+    const baseProv = { provider: srcProvider, sourceType: srcType, observed: true, verified: !!seed.source, confidence: seed.source ? 0.9 : 0.7 };
     const provenance: Provenance[] = [
-      prov("name", seed.name), prov("title", seed.title),
-      prov("company.name", seed.companyName), prov("company.domain", seed.domain ?? null),
+      prov("name", seed.name, baseProv), prov("title", seed.title, baseProv),
+      prov("company.name", seed.companyName, baseProv), prov("company.domain", seed.domain ?? null, baseProv),
     ];
 
     // Stage 2 — preliminary fit score (free, in-memory)
     const score = scoreProspect({ signals: seed.signals, title: seed.title, company: { isAiNative: seed.isAiNative } }, { championMin });
 
-    // Stage 3 gate — drop obvious low-fit below ENRICH_MIN_SCORE before paid enrichment
-    if (score.total < enrichMin) {
+    // Stage 3 gate — drop obvious low-fit below ENRICH_MIN_SCORE before paid enrichment.
+    // Live-sourced records (Clay) are ALREADY enriched, so they bypass the gate.
+    if (!seed.source && score.total < enrichMin) {
       droppedLowFit++;
       tiers[score.tier]++;
       ledger.push({ provider: "pipeline", operation: `gate:drop ${seed.name}`, timestamp: now(), success: true, cacheStatus: "n/a", retryCount: 0, note: `score ${score.total} < ${enrichMin}` });
@@ -128,12 +148,12 @@ export function runPipeline(opts?: { enrichMin?: number; championMin?: number })
 
     // Stage 4/5 — enrichment for qualified prospects (here: email inference + content/contact routes)
     enriched++;
-    const { email, provenance: emailProv } = inferEmail(seed);
-    if (emailProv) provenance.push(emailProv);
-    ledger.push({ provider: "inference", operation: `enrich:email ${seed.name}`, timestamp: now(), success: !!email, cacheStatus: "miss", retryCount: 0, estCostUsd: 0, note: email ? "pattern-inferred (unverified)" : "no pattern" });
+    const em = resolveEmail(seed);
+    if (em.provenance) provenance.push(em.provenance);
+    ledger.push({ provider: em.provider, operation: `enrich:email ${seed.name}`, timestamp: now(), success: !!em.email, cacheStatus: "miss", retryCount: 0, note: em.verified ? "verified (Clay)" : em.email ? "pattern-inferred (unverified)" : "no pattern" });
 
     const status = score.tier === "A" || score.tier === "B" ? "outreach_ready" : "qualified";
-    const record = assemble(seed, score, provenance, status, email);
+    const record = assemble(seed, score, provenance, status, em.email, em.verified, em.provider);
     record.personalization = buildPersonalization(seed, score.tier);
     tiers[score.tier]++;
     prospects.push(record);
@@ -144,7 +164,7 @@ export function runPipeline(opts?: { enrichMin?: number; championMin?: number })
   return {
     prospects, ledger,
     stats: {
-      discovered: SEED.length,
+      discovered: ALL.length,
       qualified: prospects.filter((p) => p.status !== "discovered").length,
       enriched,
       champions: prospects.filter((p) => p.score.isChampion).length,
@@ -160,9 +180,11 @@ function assemble(
   provenance: Provenance[],
   status: UnifiedProspect["status"],
   email?: string,
+  emailVerified = false,
+  emailProvider = "inference",
 ): UnifiedProspect {
   const contactRoutes: UnifiedProspect["contactRoutes"] = [];
-  if (email) contactRoutes.push({ channel: "email", value: email, verified: false, confidence: 0.35, provider: "inference" });
+  if (email) contactRoutes.push({ channel: "email", value: email, verified: emailVerified, confidence: emailVerified ? 0.95 : 0.35, provider: emailProvider });
   if (seed.linkedin) contactRoutes.push({ channel: "linkedin", value: seed.linkedin, verified: true, confidence: 0.9, provider: "seed" });
   if (seed.x) contactRoutes.push({ channel: "x", value: seed.x, verified: true, confidence: 0.9, provider: "seed" });
   if (seed.signals.runsNewsletter && seed.signals.newsletterUrl) contactRoutes.push({ channel: "newsletter_reply", value: seed.signals.newsletterUrl, verified: true, confidence: 0.8, provider: "seed" });

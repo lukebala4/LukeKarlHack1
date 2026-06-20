@@ -24,6 +24,9 @@ export type RawSeed = {
   website?: string;
   location?: string;
   emailPattern?: string; // e.g. "first.last" -> first.last@domain (pattern_inference, unverified)
+  // Live-source fields (e.g. Clay): when present, treated as verified/observed, not inferred.
+  source?: string; // "clay" | undefined(=curated_seed)
+  verifiedEmail?: string; // real, provider-verified email
   signals: ProspectSignals;
   intent?: { type: any; summary: string; sourceUrl?: string; occurredAt?: string }[];
   content?: { title: string; kind: any; themes: string[]; url?: string; excerpt?: string }[];
