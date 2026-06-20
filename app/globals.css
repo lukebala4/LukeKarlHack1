@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #0b0c0f;
+  color: #e8eaed;
+}
+
+.bar {
+  height: 6px;
+  border-radius: 9999px;
+  background: #1c2027;
+  overflow: hidden;
+}
+.bar > span {
+  display: block;
+  height: 100%;
+}
